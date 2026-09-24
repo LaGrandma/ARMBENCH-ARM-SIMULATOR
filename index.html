@@ -22,6 +22,7 @@
     import * as THREE from "three";
     import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
+    // ---- CORE ----
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0D1017);
 
@@ -45,6 +46,7 @@
     dir.position.set(1, 2, 1);
     scene.add(dir);
 
+    // ---- THE ARM ----
     const ARM = [
       { name: "base",     axis: "y", len: 0.06, min: -90,  max: 90  },
       { name: "shoulder", axis: "z", len: 0.10, min: -45,  max: 90  },
@@ -80,9 +82,71 @@
       parentLen = spec.len;
     }
 
+    // ---- END-EFFECTOR MARKER (P1) ----
+    const lastSpec = ARM[ARM.length - 1];
+    const endEffector = new THREE.Object3D();
+    endEffector.position.y = lastSpec.len;
+    joints[joints.length - 1].add(endEffector);
+    endEffector.add(new THREE.Mesh(
+      new THREE.SphereGeometry(0.012),
+      new THREE.MeshStandardMaterial({ color: 0x4ED6A0 })
+    ));
+
+    // ---- JOINT SLIDERS ----
+    const panel = document.createElement("div");
+    panel.style.cssText =
+      "position:fixed;top:12px;left:12px;padding:12px 14px;" +
+      "background:rgba(22,27,36,0.9);border:1px solid rgba(231,236,243,0.16);" +
+      "border-radius:10px;font-family:monospace;color:#E7ECF3;font-size:13px;z-index:10;";
+    document.body.appendChild(panel);
+
+    joints.forEach((joint) => {
+      const spec = joint.userData;
+      const row = document.createElement("div");
+      row.style.margin = "6px 0";
+
+      const label = document.createElement("div");
+      label.textContent = `${spec.name}: 0°`;
+      label.style.color = "#FF8A3D";
+
+      const slider = document.createElement("input");
+      slider.type = "range";
+      slider.min = spec.min;
+      slider.max = spec.max;
+      slider.value = 0;
+      slider.style.width = "180px";
+
+      slider.addEventListener("input", () => {
+        const deg = +slider.value;
+        joint.rotation[spec.axis] = deg * Math.PI / 180;
+        label.textContent = `${spec.name}: ${deg}°`;
+      });
+
+      row.appendChild(label);
+      row.appendChild(slider);
+      panel.appendChild(row);
+    });
+
+    // ---- END-EFFECTOR READOUT (P1) ----
+    const readout = document.createElement("div");
+    readout.style.cssText =
+      "position:fixed;bottom:12px;left:12px;padding:10px 14px;" +
+      "background:rgba(22,27,36,0.9);border:1px solid rgba(231,236,243,0.16);" +
+      "border-radius:10px;font-family:monospace;color:#4ED6A0;font-size:13px;z-index:10;";
+    document.body.appendChild(readout);
+
+    const tip = new THREE.Vector3();
+    function updateReadout() {
+      endEffector.getWorldPosition(tip);
+      readout.textContent =
+        `end-effector  x:${tip.x.toFixed(3)}  y:${tip.y.toFixed(3)}  z:${tip.z.toFixed(3)}  (m)`;
+    }
+
+    // ---- RENDER LOOP ----
     function animate() {
       requestAnimationFrame(animate);
       controls.update();
+      updateReadout();
       renderer.render(scene, camera);
     }
     animate();
