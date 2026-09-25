@@ -21,6 +21,7 @@
   <script type="module">
     import * as THREE from "three";
     import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { DragControls } from "three/addons/controls/DragControls.js";
 
     // ---- CORE ----
     const scene = new THREE.Scene();
@@ -92,7 +93,83 @@
       new THREE.MeshStandardMaterial({ color: 0x4ED6A0 })
     ));
 
-    // ---- JOINT SLIDERS ----
+    // ---- IK TARGET (P2) ----
+    // a draggable sphere the arm will try to reach
+    const target = new THREE.Mesh(
+      new THREE.SphereGeometry(0.02),
+      new THREE.MeshStandardMaterial({ color: 0xFF4D6D })
+    );
+    target.position.set(0.12, 0.22, 0.0);   // start somewhere reachable
+    scene.add(target);
+
+    // drag the target with the mouse; pause orbit while dragging
+    const drag = new DragControls([target], camera, renderer.domElement);
+    drag.addEventListener("dragstart", () => (controls.enabled = false));
+    drag.addEventListener("dragend",   () => (controls.enabled = true));
+
+    // ---- CCD INVERSE KINEMATICS (P2) ----
+    const IK = { enabled: false, iterations: 10, tolerance: 0.003 };
+
+    // scratch vectors/quaternion reused every frame (no garbage)
+    const _p = new THREE.Vector3();
+    const _tip = new THREE.Vector3();
+    const _tgt = new THREE.Vector3();
+    const _axis = new THREE.Vector3();
+    const _toTip = new THREE.Vector3();
+    const _toTgt = new THREE.Vector3();
+    const _cross = new THREE.Vector3();
+    const _q = new THREE.Quaternion();
+
+    const localAxis = (letter) =>
+      letter === "y" ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(0, 0, 1);
+
+    function solveIK() {
+      scene.updateMatrixWorld(true);
+      target.getWorldPosition(_tgt);
+
+      for (let iter = 0; iter < IK.iterations; iter++) {
+        // sweep from the joint nearest the tip back to the base
+        for (let i = joints.length - 1; i >= 0; i--) {
+          const joint = joints[i];
+          const spec = joint.userData;
+          const letter = spec.axis;
+
+          endEffector.getWorldPosition(_tip);
+          if (_tip.distanceTo(_tgt) < IK.tolerance) return; // close enough
+
+          joint.getWorldPosition(_p);
+          // this joint's rotation axis, in world space
+          joint.getWorldQuaternion(_q);
+          _axis.copy(localAxis(letter)).applyQuaternion(_q).normalize();
+
+          // vectors from the joint to the tip and to the target
+          _toTip.copy(_tip).sub(_p);
+          _toTgt.copy(_tgt).sub(_p);
+
+          // FLATTEN both onto the plane the hinge can actually rotate in
+          _toTip.addScaledVector(_axis, -_toTip.dot(_axis));
+          _toTgt.addScaledVector(_axis, -_toTgt.dot(_axis));
+          if (_toTip.lengthSq() < 1e-8 || _toTgt.lengthSq() < 1e-8) continue;
+          _toTip.normalize();
+          _toTgt.normalize();
+
+          // signed angle to swing toTip onto toTgt, about the hinge axis
+          _cross.crossVectors(_toTip, _toTgt);
+          const angle = Math.atan2(_cross.dot(_axis), _toTip.dot(_toTgt));
+
+          joint.rotation[letter] += angle;
+
+          // clamp to this joint's real limits
+          let deg = THREE.MathUtils.radToDeg(joint.rotation[letter]);
+          deg = Math.max(spec.min, Math.min(spec.max, deg));
+          joint.rotation[letter] = THREE.MathUtils.degToRad(deg);
+
+          joint.updateMatrixWorld(true); // refresh so the next joint sees the change
+        }
+      }
+    }
+
+    // ---- CONTROLS PANEL ----
     const panel = document.createElement("div");
     panel.style.cssText =
       "position:fixed;top:12px;left:12px;padding:12px 14px;" +
@@ -100,6 +177,18 @@
       "border-radius:10px;font-family:monospace;color:#E7ECF3;font-size:13px;z-index:10;";
     document.body.appendChild(panel);
 
+    // IK toggle
+    const ikRow = document.createElement("label");
+    ikRow.style.cssText = "display:flex;gap:8px;align-items:center;margin-bottom:8px;color:#FF4D6D;cursor:pointer;";
+    const ikBox = document.createElement("input");
+    ikBox.type = "checkbox";
+    ikBox.addEventListener("change", () => (IK.enabled = ikBox.checked));
+    ikRow.appendChild(ikBox);
+    ikRow.appendChild(document.createTextNode("Solve to target (IK)"));
+    panel.appendChild(ikRow);
+
+    // per-joint sliders
+    const jointUI = [];
     joints.forEach((joint) => {
       const spec = joint.userData;
       const row = document.createElement("div");
@@ -117,6 +206,7 @@
       slider.style.width = "180px";
 
       slider.addEventListener("input", () => {
+        if (IK.enabled) return; // IK owns the joints while it's on
         const deg = +slider.value;
         joint.rotation[spec.axis] = deg * Math.PI / 180;
         label.textContent = `${spec.name}: ${deg}°`;
@@ -125,9 +215,19 @@
       row.appendChild(label);
       row.appendChild(slider);
       panel.appendChild(row);
+      jointUI.push({ slider, label, joint, spec });
     });
 
-    // ---- END-EFFECTOR READOUT (P1) ----
+    // keep sliders showing the angles IK computed
+    function syncSliders() {
+      jointUI.forEach(({ slider, label, joint, spec }) => {
+        const deg = Math.round(THREE.MathUtils.radToDeg(joint.rotation[spec.axis]));
+        slider.value = deg;
+        label.textContent = `${spec.name}: ${deg}°`;
+      });
+    }
+
+    // ---- READOUT ----
     const readout = document.createElement("div");
     readout.style.cssText =
       "position:fixed;bottom:12px;left:12px;padding:10px 14px;" +
@@ -135,17 +235,23 @@
       "border-radius:10px;font-family:monospace;color:#4ED6A0;font-size:13px;z-index:10;";
     document.body.appendChild(readout);
 
-    const tip = new THREE.Vector3();
+    const tipPos = new THREE.Vector3();
+    const tgtPos = new THREE.Vector3();
     function updateReadout() {
-      endEffector.getWorldPosition(tip);
+      endEffector.getWorldPosition(tipPos);
+      target.getWorldPosition(tgtPos);
+      const dist = tipPos.distanceTo(tgtPos);
+      const reach = dist < 0.01 ? "reached" : (IK.enabled ? "out of reach" : "—");
       readout.textContent =
-        `end-effector  x:${tip.x.toFixed(3)}  y:${tip.y.toFixed(3)}  z:${tip.z.toFixed(3)}  (m)`;
+        `tip  x:${tipPos.x.toFixed(3)} y:${tipPos.y.toFixed(3)} z:${tipPos.z.toFixed(3)}   ` +
+        `target dist:${dist.toFixed(3)}  ${reach}`;
     }
 
     // ---- RENDER LOOP ----
     function animate() {
       requestAnimationFrame(animate);
       controls.update();
+      if (IK.enabled) { solveIK(); syncSliders(); }
       updateReadout();
       renderer.render(scene, camera);
     }
