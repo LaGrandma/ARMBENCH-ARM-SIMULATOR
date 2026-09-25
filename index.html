@@ -5,7 +5,7 @@
   <title>ARMBENCH</title>
   <style>
     body { margin: 0; overflow: hidden; background: #0D1017; }
-    canvas { display: block; }
+    canvas#scene3d { display: block; }
   </style>
 
   <script type="importmap">
@@ -35,6 +35,7 @@
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.domElement.id = "scene3d";
     document.body.appendChild(renderer.domElement);
 
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -78,12 +79,15 @@
       ));
 
       joint.userData = spec;
+      spec.target = 0;
+      spec.vel = 0;
+      spec.integ = 0;
       joints.push(joint);
       parent = joint;
       parentLen = spec.len;
     }
 
-    // ---- END-EFFECTOR MARKER (P1) ----
+    // ---- END-EFFECTOR ----
     const lastSpec = ARM[ARM.length - 1];
     const endEffector = new THREE.Object3D();
     endEffector.position.y = lastSpec.len;
@@ -93,91 +97,147 @@
       new THREE.MeshStandardMaterial({ color: 0x4ED6A0 })
     ));
 
-    // ---- IK TARGET (P2) ----
-    // a draggable sphere the arm will try to reach
+    // ---- IK TARGET ----
     const target = new THREE.Mesh(
       new THREE.SphereGeometry(0.02),
       new THREE.MeshStandardMaterial({ color: 0xFF4D6D })
     );
-    target.position.set(0.12, 0.22, 0.0);   // start somewhere reachable
+    target.position.set(0.12, 0.22, 0.0);
     scene.add(target);
 
-    // drag the target with the mouse; pause orbit while dragging
     const drag = new DragControls([target], camera, renderer.domElement);
     drag.addEventListener("dragstart", () => (controls.enabled = false));
     drag.addEventListener("dragend",   () => (controls.enabled = true));
 
-    // ---- CCD INVERSE KINEMATICS (P2) ----
+    // ---- CCD IK ----
     const IK = { enabled: false, iterations: 10, tolerance: 0.003 };
-
-    // scratch vectors/quaternion reused every frame (no garbage)
-    const _p = new THREE.Vector3();
-    const _tip = new THREE.Vector3();
-    const _tgt = new THREE.Vector3();
-    const _axis = new THREE.Vector3();
-    const _toTip = new THREE.Vector3();
-    const _toTgt = new THREE.Vector3();
-    const _cross = new THREE.Vector3();
-    const _q = new THREE.Quaternion();
-
-    const localAxis = (letter) =>
-      letter === "y" ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(0, 0, 1);
+    const _p = new THREE.Vector3(), _tip = new THREE.Vector3(), _tgt = new THREE.Vector3();
+    const _axis = new THREE.Vector3(), _toTip = new THREE.Vector3(), _toTgt = new THREE.Vector3();
+    const _cross = new THREE.Vector3(), _q = new THREE.Quaternion();
+    const localAxis = (l) => l === "y" ? new THREE.Vector3(0,1,0) : new THREE.Vector3(0,0,1);
 
     function solveIK() {
-      scene.updateMatrixWorld(true);
+      const saved = joints.map(j => j.rotation[j.userData.axis]);
       target.getWorldPosition(_tgt);
-
       for (let iter = 0; iter < IK.iterations; iter++) {
-        // sweep from the joint nearest the tip back to the base
+        let done = false;
         for (let i = joints.length - 1; i >= 0; i--) {
-          const joint = joints[i];
-          const spec = joint.userData;
-          const letter = spec.axis;
-
+          const joint = joints[i], spec = joint.userData, letter = spec.axis;
           endEffector.getWorldPosition(_tip);
-          if (_tip.distanceTo(_tgt) < IK.tolerance) return; // close enough
-
+          if (_tip.distanceTo(_tgt) < IK.tolerance) { done = true; break; }
           joint.getWorldPosition(_p);
-          // this joint's rotation axis, in world space
           joint.getWorldQuaternion(_q);
           _axis.copy(localAxis(letter)).applyQuaternion(_q).normalize();
-
-          // vectors from the joint to the tip and to the target
-          _toTip.copy(_tip).sub(_p);
-          _toTgt.copy(_tgt).sub(_p);
-
-          // FLATTEN both onto the plane the hinge can actually rotate in
+          _toTip.copy(_tip).sub(_p); _toTgt.copy(_tgt).sub(_p);
           _toTip.addScaledVector(_axis, -_toTip.dot(_axis));
           _toTgt.addScaledVector(_axis, -_toTgt.dot(_axis));
           if (_toTip.lengthSq() < 1e-8 || _toTgt.lengthSq() < 1e-8) continue;
-          _toTip.normalize();
-          _toTgt.normalize();
-
-          // signed angle to swing toTip onto toTgt, about the hinge axis
+          _toTip.normalize(); _toTgt.normalize();
           _cross.crossVectors(_toTip, _toTgt);
           const angle = Math.atan2(_cross.dot(_axis), _toTip.dot(_toTgt));
-
           joint.rotation[letter] += angle;
-
-          // clamp to this joint's real limits
           let deg = THREE.MathUtils.radToDeg(joint.rotation[letter]);
           deg = Math.max(spec.min, Math.min(spec.max, deg));
           joint.rotation[letter] = THREE.MathUtils.degToRad(deg);
-
-          joint.updateMatrixWorld(true); // refresh so the next joint sees the change
+          joint.updateMatrixWorld(true);
         }
+        if (done) break;
       }
+      joints.forEach((j, i) => {
+        j.userData.target = j.rotation[j.userData.axis];
+        j.rotation[j.userData.axis] = saved[i];
+      });
+      scene.updateMatrixWorld(true);
+    }
+
+    // ---- PID ----
+    const PID = { kp: 120, ki: 0, kd: 8, iClamp: 40 };
+    function stepPhysics(dt) {
+      for (const joint of joints) {
+        const s = joint.userData;
+        const cur = joint.rotation[s.axis];
+        const e = s.target - cur;
+        s.integ += e * dt;
+        s.integ = Math.max(-PID.iClamp, Math.min(PID.iClamp, s.integ));
+        const u = PID.kp * e + PID.ki * s.integ - PID.kd * s.vel;
+        s.vel += u * dt;
+        let next = cur + s.vel * dt;
+        let deg = THREE.MathUtils.radToDeg(next);
+        if (deg < s.min) { deg = s.min; s.vel = 0; }
+        if (deg > s.max) { deg = s.max; s.vel = 0; }
+        joint.rotation[s.axis] = THREE.MathUtils.degToRad(deg);
+      }
+    }
+
+    let _last = performance.now(), _acc = 0;
+    const PHYS_DT = 1 / 120;
+
+    // ---- RESPONSE PLOT (P3 step 3) ----
+    const plotJoint = { index: 1 };                 // which joint to graph (default: shoulder)
+    const BUF = 400;                                // samples kept on screen
+    const hist = joints.map(() => ({ act: new Array(BUF).fill(null), tgt: new Array(BUF).fill(null) }));
+
+    const plot = document.createElement("canvas");
+    plot.width = 460; plot.height = 200;
+    plot.style.cssText =
+      "position:fixed;top:12px;right:12px;background:rgba(10,13,19,0.92);" +
+      "border:1px solid rgba(231,236,243,0.16);border-radius:10px;z-index:10;";
+    document.body.appendChild(plot);
+    const ctx = plot.getContext("2d");
+
+    function pushSample() {
+      joints.forEach((j, i) => {
+        const s = j.userData;
+        const h = hist[i];
+        h.act.push(THREE.MathUtils.radToDeg(j.rotation[s.axis])); h.act.shift();
+        h.tgt.push(THREE.MathUtils.radToDeg(s.target));          h.tgt.shift();
+      });
+    }
+
+    function drawPlot() {
+      const i = plotJoint.index, s = joints[i].userData, h = hist[i];
+      const W = plot.width, H = plot.height, pad = 24;
+      ctx.clearRect(0, 0, W, H);
+
+      // y maps [min,max] -> [H-pad, pad]
+      const y = (deg) => (H - pad) - (deg - s.min) / (s.max - s.min) * (H - 2 * pad);
+      const x = (k) => pad + k / (BUF - 1) * (W - pad - 8);
+
+      // zero line
+      ctx.strokeStyle = "rgba(231,236,243,0.12)"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pad, y(0)); ctx.lineTo(W - 8, y(0)); ctx.stroke();
+
+      // target line (flat, red)
+      ctx.strokeStyle = "#FF4D6D"; ctx.beginPath();
+      let started = false;
+      h.tgt.forEach((v, k) => { if (v == null) return;
+        const px = x(k), py = y(v);
+        started ? ctx.lineTo(px, py) : (ctx.moveTo(px, py), started = true); });
+      ctx.stroke();
+
+      // actual line (green)
+      ctx.strokeStyle = "#4ED6A0"; ctx.lineWidth = 1.5; ctx.beginPath();
+      started = false;
+      h.act.forEach((v, k) => { if (v == null) return;
+        const px = x(k), py = y(v);
+        started ? ctx.lineTo(px, py) : (ctx.moveTo(px, py), started = true); });
+      ctx.stroke();
+
+      // labels
+      ctx.fillStyle = "#93A2B4"; ctx.font = "11px monospace";
+      ctx.fillText(`${s.name}  (target ─ red, actual ─ green)`, pad, 14);
+      ctx.fillText(`${s.max}°`, 2, y(s.max) + 4);
+      ctx.fillText(`${s.min}°`, 2, y(s.min) + 4);
     }
 
     // ---- CONTROLS PANEL ----
     const panel = document.createElement("div");
     panel.style.cssText =
-      "position:fixed;top:12px;left:12px;padding:12px 14px;" +
+      "position:fixed;top:12px;left:12px;padding:12px 14px;max-height:92vh;overflow:auto;" +
       "background:rgba(22,27,36,0.9);border:1px solid rgba(231,236,243,0.16);" +
       "border-radius:10px;font-family:monospace;color:#E7ECF3;font-size:13px;z-index:10;";
     document.body.appendChild(panel);
 
-    // IK toggle
     const ikRow = document.createElement("label");
     ikRow.style.cssText = "display:flex;gap:8px;align-items:center;margin-bottom:8px;color:#FF4D6D;cursor:pointer;";
     const ikBox = document.createElement("input");
@@ -187,43 +247,67 @@
     ikRow.appendChild(document.createTextNode("Solve to target (IK)"));
     panel.appendChild(ikRow);
 
-    // per-joint sliders
+    // joint picker for the plot
+    const pickRow = document.createElement("div");
+    pickRow.style.margin = "2px 0 8px";
+    pickRow.style.color = "#4ED6A0";
+    pickRow.appendChild(document.createTextNode("plot joint: "));
+    const picker = document.createElement("select");
+    joints.forEach((j, i) => {
+      const o = document.createElement("option");
+      o.value = i; o.textContent = j.userData.name;
+      if (i === plotJoint.index) o.selected = true;
+      picker.appendChild(o);
+    });
+    picker.addEventListener("change", () => (plotJoint.index = +picker.value));
+    pickRow.appendChild(picker);
+    panel.appendChild(pickRow);
+
+    // PID gain sliders
+    const gainWrap = document.createElement("div");
+    gainWrap.style.cssText = "margin:4px 0 10px;padding:8px 0;border-top:1px solid rgba(231,236,243,0.12);border-bottom:1px solid rgba(231,236,243,0.12);";
+    panel.appendChild(gainWrap);
+    function gainSlider(name, key, min, max, step) {
+      const row = document.createElement("div"); row.style.margin = "5px 0";
+      const label = document.createElement("div"); label.style.color = "#4FB8FF";
+      label.textContent = `${name}: ${PID[key]}`;
+      const slider = document.createElement("input");
+      slider.type = "range"; slider.min = min; slider.max = max; slider.step = step;
+      slider.value = PID[key]; slider.style.width = "180px";
+      slider.addEventListener("input", () => {
+        PID[key] = +slider.value; label.textContent = `${name}: ${PID[key]}`;
+        if (key === "ki") joints.forEach(j => j.userData.integ = 0);
+      });
+      row.appendChild(label); row.appendChild(slider); gainWrap.appendChild(row);
+    }
+    gainSlider("Kp", "kp", 0, 400, 1);
+    gainSlider("Ki", "ki", 0, 200, 1);
+    gainSlider("Kd", "kd", 0, 60, 0.5);
+
+    // per-joint command sliders
     const jointUI = [];
     joints.forEach((joint) => {
       const spec = joint.userData;
-      const row = document.createElement("div");
-      row.style.margin = "6px 0";
-
+      const row = document.createElement("div"); row.style.margin = "6px 0";
       const label = document.createElement("div");
-      label.textContent = `${spec.name}: 0°`;
-      label.style.color = "#FF8A3D";
-
+      label.textContent = `${spec.name}: 0°`; label.style.color = "#FF8A3D";
       const slider = document.createElement("input");
-      slider.type = "range";
-      slider.min = spec.min;
-      slider.max = spec.max;
-      slider.value = 0;
-      slider.style.width = "180px";
-
+      slider.type = "range"; slider.min = spec.min; slider.max = spec.max;
+      slider.value = 0; slider.style.width = "180px";
       slider.addEventListener("input", () => {
-        if (IK.enabled) return; // IK owns the joints while it's on
+        if (IK.enabled) return;
         const deg = +slider.value;
-        joint.rotation[spec.axis] = deg * Math.PI / 180;
-        label.textContent = `${spec.name}: ${deg}°`;
+        spec.target = THREE.MathUtils.degToRad(deg);
+        label.textContent = `${spec.name}: ${deg}° (cmd)`;
       });
-
-      row.appendChild(label);
-      row.appendChild(slider);
-      panel.appendChild(row);
+      row.appendChild(label); row.appendChild(slider); panel.appendChild(row);
       jointUI.push({ slider, label, joint, spec });
     });
 
-    // keep sliders showing the angles IK computed
     function syncSliders() {
       jointUI.forEach(({ slider, label, joint, spec }) => {
         const deg = Math.round(THREE.MathUtils.radToDeg(joint.rotation[spec.axis]));
-        slider.value = deg;
-        label.textContent = `${spec.name}: ${deg}°`;
+        slider.value = deg; label.textContent = `${spec.name}: ${deg}°`;
       });
     }
 
@@ -235,8 +319,7 @@
       "border-radius:10px;font-family:monospace;color:#4ED6A0;font-size:13px;z-index:10;";
     document.body.appendChild(readout);
 
-    const tipPos = new THREE.Vector3();
-    const tgtPos = new THREE.Vector3();
+    const tipPos = new THREE.Vector3(), tgtPos = new THREE.Vector3();
     function updateReadout() {
       endEffector.getWorldPosition(tipPos);
       target.getWorldPosition(tgtPos);
@@ -247,11 +330,16 @@
         `target dist:${dist.toFixed(3)}  ${reach}`;
     }
 
-    // ---- RENDER LOOP ----
+    // ---- LOOP ----
     function animate() {
       requestAnimationFrame(animate);
       controls.update();
-      if (IK.enabled) { solveIK(); syncSliders(); }
+      const now = performance.now();
+      _acc += Math.min((now - _last) / 1000, 0.05); _last = now;
+      if (IK.enabled) solveIK();
+      while (_acc >= PHYS_DT) { stepPhysics(PHYS_DT); pushSample(); _acc -= PHYS_DT; }
+      if (IK.enabled) syncSliders();
+      drawPlot();
       updateReadout();
       renderer.render(scene, camera);
     }
