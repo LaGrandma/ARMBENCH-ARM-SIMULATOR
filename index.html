@@ -123,7 +123,7 @@
     const _jp=new THREE.Vector3(),_cm=new THREE.Vector3();
     function gravityTorque(idx) {
       const joint=joints[idx], spec=joint.userData;
-      if (spec.axis==="y") return 0;               // vertical axis: no gravity twist
+      if (spec.axis==="y") return 0;
       joint.getWorldPosition(_jp);
       let torque=0;
       for (let k=idx;k<joints.length;k++){
@@ -157,9 +157,9 @@
 
     // ---- COLLISION DETECTION (capsule model) ----
     const COLL = { block:true, ground:false, self:false };
-    const LINK_R = 0.016;                       // link capsule radius
+    const LINK_R = 0.016;
     const clamp01 = (v)=>Math.max(0,Math.min(1,v));
-    function segSegDist(p1,q1,p2,q2){           // shortest distance between two segments
+    function segSegDist(p1,q1,p2,q2){
       const d1=q1.clone().sub(p1), d2=q2.clone().sub(p2), r=p1.clone().sub(p2);
       const a=d1.dot(d1), e=d2.dot(d2), f=d2.dot(r); let s,t;
       if(a<=1e-9&&e<=1e-9) return r.length();
@@ -182,10 +182,10 @@
       for(let i=0;i<joints.length;i++) seg.push([pts[i], i<joints.length-1?pts[i+1]:eff]);
       const hit=new Array(joints.length).fill(false);
       let ground=false, self=false;
-      for(let i=1;i<seg.length;i++){                      // skip base link (it's the mount)
+      for(let i=1;i<seg.length;i++){
         if(Math.min(seg[i][0].y,seg[i][1].y)-LINK_R<0){ hit[i]=true; ground=true; }
       }
-      for(let i=0;i<seg.length;i++) for(let k=i+2;k<seg.length;k++){   // non-adjacent only
+      for(let i=0;i<seg.length;i++) for(let k=i+2;k<seg.length;k++){
         if(segSegDist(seg[i][0],seg[i][1],seg[k][0],seg[k][1])<LINK_R*2){ hit[i]=hit[k]=true; self=true; }
       }
       return {hit, ground, self, any:ground||self};
@@ -212,41 +212,192 @@
       TRAJ.t = 0; TRAJ.active = true;
     }
 
+    // ---- CONTROL METRICS (step response + tracking) ----
+    let simT = 0;
+    const MET = joints.map(()=>({ lastTgt:0, idle:true, startAct:0, finalTgt:0, t0:0,
+      lastChange:-1, lastOut:0, peak:0, t10:null, t90:null, still:null, res:null }));
+    function tickMetrics(dt){
+      simT += dt;
+      joints.forEach((j,i)=>{
+        const s=j.userData, m=MET[i];
+        const tgt=THREE.MathUtils.radToDeg(s.target);
+        const act=THREE.MathUtils.radToDeg(j.rotation[s.axis]);
+
+        if(Math.abs(tgt-m.lastTgt)>0.05){                  // target moved → (new) move
+          if(m.idle){ m.idle=false; m.startAct=act; m.t0=simT; m.peak=0; m.t10=null; m.t90=null; }
+          m.lastChange=simT; m.finalTgt=tgt; m.lastTgt=tgt; m.lastOut=simT;
+        }
+        if(m.idle) return;
+
+        const step=m.finalTgt-m.startAct;
+        if(Math.abs(step)<0.5){ m.idle=true; return; }     // too small to measure
+        const dir=Math.sign(step), prog=(act-m.startAct)/step;
+        if(m.t10===null && prog>=0.1) m.t10=simT;
+        if(m.t90===null && prog>=0.9) m.t90=simT;
+        m.peak=Math.max(m.peak,(act-m.finalTgt)*dir);      // how far past the target
+        const band=Math.max(0.02*Math.abs(step),0.5);      // ±2% settling band
+        const inBand=Math.abs(act-m.finalTgt)<=band;
+        if(!inBand) m.lastOut=simT;
+
+        if(Math.abs(s.vel)<0.03){ if(m.still===null) m.still=simT; } else m.still=null;
+        if(simT-m.lastChange>0.3 && m.still!==null && simT-m.still>0.5){   // motion has stopped
+          m.idle=true;
+          m.res={ step, band,
+            overshoot: Math.max(0,m.peak)/Math.abs(step)*100,
+            rise: (m.t10!==null&&m.t90!==null) ? m.t90-m.t10 : null,
+            settle: inBand ? m.lastOut-m.t0 : null };
+        }
+      });
+    }
+
     // ---- PLOT ----
     const plotJoint={index:1}; const BUF=400;
     const hist=joints.map(()=>({act:new Array(BUF).fill(null),tgt:new Array(BUF).fill(null)}));
-    const plot=document.createElement("canvas"); plot.width=460; plot.height=200;
-    plot.style.cssText="position:fixed;top:12px;right:12px;background:rgba(10,13,19,0.92);"+
-      "border:1px solid rgba(231,236,243,0.16);border-radius:10px;z-index:10;";
-    document.body.appendChild(plot); const ctx=plot.getContext("2d");
+        // ---- RIGHT DOCK: chart + metrics (collapsible, resizable) ----
+    const PLOT_SIZE={ w:Math.min(460, Math.round(innerWidth*0.42)), h:200 };
+    const rightWrap=document.createElement("div");
+    rightWrap.style.cssText="position:fixed;top:12px;right:12px;z-index:10;display:flex;flex-direction:column;"+
+      "max-height:calc(100vh - 24px);background:rgba(10,13,19,0.92);border:1px solid rgba(231,236,243,0.16);"+
+      "border-radius:10px;font-family:monospace;color:#E7ECF3;";
+    document.body.appendChild(rightWrap);
+
+    const rightHead=document.createElement("button");
+    rightHead.style.cssText="display:flex;justify-content:space-between;align-items:center;gap:16px;"+
+      "padding:8px 14px;background:transparent;border:none;color:#93A2B4;font-family:monospace;"+
+      "font-size:12px;cursor:pointer;text-align:left;";
+    rightHead.innerHTML="<span>CHART & METRICS</span><span id='right-chev'>▾</span>";
+    rightWrap.appendChild(rightHead);
+
+    const rightBody=document.createElement("div");
+    rightBody.style.cssText="overflow:auto;border-top:1px solid rgba(231,236,243,0.12);";
+    rightWrap.appendChild(rightBody);
+
+    const plot=document.createElement("canvas");
+    plot.style.display="block";
+    rightBody.appendChild(plot); const ctx=plot.getContext("2d");
+    function sizePlot(){                              // crisp on retina screens
+      const dpr=devicePixelRatio||1;
+      plot.width=Math.round(PLOT_SIZE.w*dpr); plot.height=Math.round(PLOT_SIZE.h*dpr);
+      plot.style.width=PLOT_SIZE.w+"px"; plot.style.height=PLOT_SIZE.h+"px";
+      rightBody.style.width=PLOT_SIZE.w+"px";
+    }
+    sizePlot();
+
+    // resize grip, bottom-left corner: drag left/down = bigger, right/up = smaller
+     const grip=document.createElement("div");
+    grip.title="drag to resize";
+    grip.style.cssText="position:absolute;left:0;bottom:0;width:16px;height:16px;cursor:nesw-resize;"+
+      "border-left:2px solid #4FB8FF;border-bottom:2px solid #4FB8FF;border-bottom-left-radius:10px;opacity:0.75;";
+    rightWrap.appendChild(grip);
+    grip.addEventListener("pointerdown",(e)=>{
+      e.preventDefault(); grip.setPointerCapture(e.pointerId);
+      const sx=e.clientX, sy=e.clientY, sw=PLOT_SIZE.w, sh=PLOT_SIZE.h;
+      const move=(ev)=>{
+        PLOT_SIZE.w=Math.max(220, Math.min(innerWidth-40, sw-(ev.clientX-sx)));
+        PLOT_SIZE.h=Math.max(90,  Math.min(innerHeight*0.7, sh+(ev.clientY-sy)));
+        sizePlot();
+      };
+      const up=()=>{ grip.removeEventListener("pointermove",move); grip.removeEventListener("pointerup",up); };
+      grip.addEventListener("pointermove",move); grip.addEventListener("pointerup",up);
+    });
+
+    rightHead.onclick=()=>{
+      const hid=rightBody.style.display==="none";
+      rightBody.style.display=hid?"":"none"; grip.style.display=hid?"":"none";
+      document.getElementById("right-chev").textContent=hid?"▾":"▸";
+    };
     function pushSample(){ joints.forEach((j,i)=>{ const s=j.userData,h=hist[i];
       h.act.push(THREE.MathUtils.radToDeg(j.rotation[s.axis])); h.act.shift();
       h.tgt.push(THREE.MathUtils.radToDeg(s.target)); h.tgt.shift(); }); }
     function drawPlot(){
-      const i=plotJoint.index,s=joints[i].userData,h=hist[i];
-      const W=plot.width,H=plot.height,pad=24;
+      const i=plotJoint.index,s=joints[i].userData,h=hist[i],m=MET[i];
+            const W=PLOT_SIZE.w,H=PLOT_SIZE.h,pad=24;
+      ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
       ctx.clearRect(0,0,W,H);
       const y=(deg)=>(H-pad)-(deg-s.min)/(s.max-s.min)*(H-2*pad);
       const x=(k)=>pad+k/(BUF-1)*(W-pad-8);
       ctx.strokeStyle="rgba(231,236,243,0.12)"; ctx.lineWidth=1;
       ctx.beginPath(); ctx.moveTo(pad,y(0)); ctx.lineTo(W-8,y(0)); ctx.stroke();
-      ctx.strokeStyle="#FF4D6D"; ctx.beginPath(); let st=false;
+
+      // ±2% settling band around the final target (dashed)
+      const step=m.finalTgt-m.startAct;
+      if(m.lastChange>=0 && Math.abs(step)>=0.5){
+        const band=Math.max(0.02*Math.abs(step),0.5);
+        ctx.strokeStyle="rgba(255,77,109,0.35)"; ctx.setLineDash([4,4]);
+        [m.finalTgt+band, m.finalTgt-band].forEach(v=>{
+          ctx.beginPath(); ctx.moveTo(pad,y(v)); ctx.lineTo(W-8,y(v)); ctx.stroke(); });
+        ctx.setLineDash([]);
+      }
+
+      ctx.strokeStyle="#FF4D6D"; ctx.lineWidth=1; ctx.beginPath(); let st=false;
       h.tgt.forEach((v,k)=>{ if(v==null)return; const px=x(k),py=y(v);
         st?ctx.lineTo(px,py):(ctx.moveTo(px,py),st=true); }); ctx.stroke();
       ctx.strokeStyle="#4ED6A0"; ctx.lineWidth=1.5; ctx.beginPath(); st=false;
       h.act.forEach((v,k)=>{ if(v==null)return; const px=x(k),py=y(v);
         st?ctx.lineTo(px,py):(ctx.moveTo(px,py),st=true); }); ctx.stroke();
       ctx.fillStyle="#93A2B4"; ctx.font="11px monospace";
-      ctx.fillText(`${s.name}  (target ─ red, actual ─ green)`,pad,14);
+      ctx.fillText(`${s.name}  (target ─ red, actual ─ green, ±2% band ┄)`,pad,14);
       ctx.fillText(`${s.max}°`,2,y(s.max)+4); ctx.fillText(`${s.min}°`,2,y(s.min)+4);
     }
 
+    // ---- METRICS PANEL (under the plot) ----
+      const metBox=document.createElement("div");
+    metBox.style.cssText="box-sizing:border-box;padding:10px 14px 16px;border-top:1px solid rgba(231,236,243,0.12);"+
+      "font-family:monospace;font-size:12px;color:#E7ECF3;";
+    rightBody.appendChild(metBox);
+    function updateMetrics(){
+      const i=plotJoint.index, j=joints[i], s=j.userData, m=MET[i], h=hist[i], r=m.res;
+      let n=0,sum=0,mx=0;
+      for(let k=0;k<BUF;k++){ const a=h.act[k],t=h.tgt[k]; if(a==null||t==null) continue;
+        const e=a-t; sum+=e*e; mx=Math.max(mx,Math.abs(e)); n++; }
+      const rms=n?Math.sqrt(sum/n):0;
+      const ess=Math.abs(THREE.MathUtils.radToDeg(s.target-j.rotation[s.axis]));
+      const f=(v,u,d=2)=>v==null?"—":v.toFixed(d)+u;
+      const state=!m.idle?"<span style='color:#FF8A3D'>moving…</span>"
+                 :(r?"<span style='color:#4ED6A0'>settled</span>":"<span style='color:#93A2B4'>idle</span>");
+      const row=(k,v)=>`<div style='display:flex;justify-content:space-between;'><span style='color:#93A2B4'>${k}</span><span>${v}</span></div>`;
+      metBox.innerHTML=
+        `<div style='display:flex;justify-content:space-between;margin-bottom:6px;'>`+
+          `<span style='color:#4FB8FF'>${s.name} · step response</span>${state}</div>`+
+        `<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:3px 22px;'>`+
+          row("step size", r?f(r.step,"°",1):"—")+
+          row("overshoot", r?f(r.overshoot,"%",1):"—")+
+          row("rise time 10–90%", r?f(r.rise,"s"):"—")+
+          row("settling ±2%", r?(r.settle==null?"never in band":f(r.settle,"s")):"—")+
+          row("steady-state err", m.idle?f(ess,"°"):"—")+
+          row("RMS tracking err", f(rms,"°"))+
+          row("max tracking err", f(mx,"°"))+
+          row("window", (BUF*PHYS_DT).toFixed(1)+"s")+
+        `</div>`;
+    }
+    setInterval(updateMetrics, 100);
+
     // ---- PANEL ----
-    const panel=document.createElement("div");
-    panel.style.cssText="position:fixed;top:12px;left:12px;padding:12px 14px;max-height:92vh;overflow:auto;"+
+        // outer wrapper (fixed, holds the header + collapsible body)
+    const panelWrap=document.createElement("div");
+    panelWrap.style.cssText="position:fixed;top:12px;left:12px;max-height:92vh;display:flex;flex-direction:column;"+
       "background:rgba(22,27,36,0.9);border:1px solid rgba(231,236,243,0.16);border-radius:10px;"+
       "font-family:monospace;color:#E7ECF3;font-size:13px;z-index:10;";
-    document.body.appendChild(panel);
+    document.body.appendChild(panelWrap);
+
+    // clickable header
+    const panelHead=document.createElement("button");
+    panelHead.style.cssText="display:flex;justify-content:space-between;align-items:center;gap:16px;width:100%;"+
+      "padding:8px 14px;background:transparent;border:none;color:#93A2B4;font-family:monospace;"+
+      "font-size:12px;cursor:pointer;text-align:left;";
+    panelHead.innerHTML="<span>CONTROLS</span><span id='panel-chev'>▾</span>";
+    panelWrap.appendChild(panelHead);
+
+    // the body — everything below still appends to `panel`
+    const panel=document.createElement("div");
+    panel.style.cssText="padding:4px 14px 12px;overflow:auto;border-top:1px solid rgba(231,236,243,0.12);";
+    panelWrap.appendChild(panel);
+
+    panelHead.onclick=()=>{
+      const hidden=panel.style.display==="none";
+      panel.style.display=hidden?"":"none";
+      document.getElementById("panel-chev").textContent=hidden?"▾":"▸";
+    };
 
     const ikRow=document.createElement("label");
     ikRow.style.cssText="display:flex;gap:8px;align-items:center;margin-bottom:8px;color:#FF4D6D;cursor:pointer;";
@@ -385,16 +536,16 @@
       }
 
       if(IK.enabled && !TRAJ.active) solveIK();
-      const safe = joints.map(j=>j.rotation[j.userData.axis]);   // last collision-free pose
-      while(_acc>=PHYS_DT){ stepPhysics(PHYS_DT); pushSample(); _acc-=PHYS_DT; }
+      const safe = joints.map(j=>j.rotation[j.userData.axis]);
+      while(_acc>=PHYS_DT){ stepPhysics(PHYS_DT); pushSample(); tickMetrics(PHYS_DT); _acc-=PHYS_DT; }
       const col = checkCollisions();
       COLL.ground=col.ground; COLL.self=col.self;
-      if(col.any && COLL.block){                                 // roll back to safe pose
+      if(col.any && COLL.block){
         joints.forEach((j,i)=>{ j.rotation[j.userData.axis]=safe[i]; j.userData.vel=0; });
         scene.updateMatrixWorld(true);
       }
       joints.forEach((j,i)=>{ const m=j.userData.linkMesh; if(m)
-        m.material.color.setHex(col.hit[i]?0xFF4D6D:0xFF8A3D); });   // red = in contact
+        m.material.color.setHex(col.hit[i]?0xFF4D6D:0xFF8A3D); });
       if(IK.enabled || TRAJ.active) syncSliders();
 
       drawPlot(); updateReadout();
